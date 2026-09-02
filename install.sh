@@ -40,6 +40,7 @@ GROK_BOT_DAEMON_SCRIPT="$daemon_script" \
   node "$repo_dir/grok-bot-headless.mjs" check --local
 
 mkdir -p "$bin_dir" "$lib_dir" "$unit_dir" "$config_dir"
+chmod 0700 "$config_dir"
 install -m 0755 "$repo_dir/grok-bot-headless.mjs" "$lib_dir/grok-bot-headless.mjs"
 install -m 0755 "$repo_dir/bin/grok-bot-headless" "$bin_dir/grok-bot-headless"
 install -m 0644 "$repo_dir/grok-bot-headless.service" "$unit_dir/grok-bot-headless.service"

@@ -24,6 +24,7 @@ test -x "$home_dir/.local/bin/grok-bot-headless"
 test -x "$home_dir/.local/lib/grok-bot-headless/grok-bot-headless.mjs"
 test -f "$home_dir/.config/systemd/user/grok-bot-headless.service"
 test "$(stat -c '%a' "$home_dir/.config/grok-bot-headless/environment")" = 600
+test "$(stat -c '%a' "$home_dir/.config/grok-bot-headless")" = 700
 HOME="$home_dir" "$home_dir/.local/bin/grok-bot-headless" help >/dev/null
 check_output="$(
   HOME="$home_dir" \
