@@ -1,0 +1,18 @@
+{
+  "name": "grok-bot-headless-node",
+  "version": "0.1.0",
+  "description": "Unofficial native headless controller for the Grok Bot local-computer daemon",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:andreanjos/grokbot-headless",
+  "scripts": {
+    "test": "node --test && bash test/install.test.sh"
+  },
+  "bin": {
+    "grok-bot-headless": "./grok-bot-headless.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

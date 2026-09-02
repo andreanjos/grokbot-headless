@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+*.log
+*.tmp
+.env
+.env.*
+credentials.json
+machine.json
+local-exec-daemon*.json
+local-exec-supervisor.json
+settings.json

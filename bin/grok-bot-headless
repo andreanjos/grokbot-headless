@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -eu
+
+exec node "${HOME}/.local/lib/grok-bot-headless/grok-bot-headless.mjs" "$@"

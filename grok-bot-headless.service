@@ -1,0 +1,17 @@
+[Unit]
+Description=Native Grok Bot local-computer node
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=%h/.config/grok-bot-headless/credentials.json
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/grok-bot-headless/environment
+ExecStart=%h/.local/bin/grok-bot-headless run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
