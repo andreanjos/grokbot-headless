@@ -7,6 +7,7 @@ ConditionPathExists=%h/.config/grok-bot-headless/credentials.json
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/grok-bot-headless/environment
+ExecCondition=%h/.local/bin/grok-bot-headless check --local
 ExecStart=%h/.local/bin/grok-bot-headless run
 Restart=on-failure
 RestartSec=5s

@@ -5,6 +5,8 @@ import {
   accountScope,
   base64url,
   cursorChecksum,
+  hasCredentialShape,
+  isTestedClientVersion,
   jwtPayload,
   trimSlash,
   validatedServiceUrl,
@@ -32,6 +34,18 @@ test('base64url uses URL-safe encoding without padding', () => {
 
 test('cursorChecksum matches the Grok Bot byte transform', () => {
   assert.equal(cursorChecksum('machine-123', 1_788_370_000_000), '7D9BXRjPmachine-123');
+});
+
+test('compatibility metadata identifies tested client versions', () => {
+  assert.equal(isTestedClientVersion('0.30.0'), true);
+  assert.equal(isTestedClientVersion('99.0.0'), false);
+});
+
+test('credential validation requires both non-empty tokens', () => {
+  assert.equal(hasCredentialShape({ accessToken: 'access', refreshToken: 'refresh' }), true);
+  assert.equal(hasCredentialShape({ accessToken: 'access' }), false);
+  assert.equal(hasCredentialShape({ accessToken: '', refreshToken: 'refresh' }), false);
+  assert.equal(hasCredentialShape(null), false);
 });
 
 test('JWT payload and account scope use the token subject', () => {

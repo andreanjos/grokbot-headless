@@ -79,6 +79,7 @@ sudo loginctl enable-linger "$USER"
 grok-bot-headless login
 grok-bot-headless run
 grok-bot-headless status
+grok-bot-headless check [--local]
 grok-bot-headless policy <always|ask|never>
 grok-bot-headless logout
 ```
@@ -93,6 +94,26 @@ systemctl --user status grok-bot-headless
 systemctl --user restart grok-bot-headless
 journalctl --user -u grok-bot-headless -f
 ```
+
+## Compatibility checks
+
+Run the full check after the official Grok Bot package updates:
+
+```bash
+grok-bot-headless check
+```
+
+The check reads the installed version, resolves the daemon entry point from the installed package, validates the saved credential format, contacts the current backend, and mints both required runtime credentials. It makes no shell or file request through Grok Bot.
+
+Use the local-only check before account login or without network access:
+
+```bash
+grok-bot-headless check --local
+```
+
+The installer runs the local check before it changes installed files. The systemd service runs it again before each start. An incompatible local package stops the installation or service start with an error. A full check stops with an error if authentication or the remote credential protocol fails.
+
+The JSON result includes `testedVersion`. A value of `false` means that the exact package version is new. It does not mean that the package failed. The structural and remote checks determine the compatibility result.
 
 ## Architecture
 

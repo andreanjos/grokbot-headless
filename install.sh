@@ -34,6 +34,10 @@ if [[ ! -x "$app_bin" || ! -f "$daemon_container" ]]; then
   printf 'Install Grok Bot first, or set GROK_BOT_BINARY and GROK_BOT_DAEMON_SCRIPT.\n' >&2
   exit 1
 fi
+printf 'Checking Grok Bot compatibility...\n'
+GROK_BOT_BINARY="$app_bin" \
+GROK_BOT_DAEMON_SCRIPT="$daemon_script" \
+  node "$repo_dir/grok-bot-headless.mjs" check --local
 
 mkdir -p "$bin_dir" "$lib_dir" "$unit_dir" "$config_dir"
 install -m 0755 "$repo_dir/grok-bot-headless.mjs" "$lib_dir/grok-bot-headless.mjs"

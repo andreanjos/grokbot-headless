@@ -29,7 +29,11 @@ const DAEMON_CONTAINER_PATH = DAEMON_SCRIPT.includes('.asar/')
   ? `${DAEMON_SCRIPT.slice(0, DAEMON_SCRIPT.indexOf('.asar/'))}.asar`
   : DAEMON_SCRIPT;
 const PACKAGE_JSON_PATH = process.env.GROK_BOT_PACKAGE_JSON || join(dirname(APP_BINARY), 'resources', 'app.asar', 'package.json');
-const CLIENT_VERSION = process.env.SAND_CLIENT_APP_VERSION || installedVersion();
+const TESTED_CLIENT_VERSIONS = Object.freeze(['0.30.0']);
+const DETECTED_CLIENT_VERSION = installedVersion();
+const CLIENT_VERSION = process.env.SAND_CLIENT_APP_VERSION
+  || DETECTED_CLIENT_VERSION
+  || TESTED_CLIENT_VERSIONS[TESTED_CLIENT_VERSIONS.length - 1];
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const DESCRIPTOR_REFRESH_MS = 60 * 1000;
 const HEARTBEAT_MS = 20 * 1000;
@@ -67,11 +71,62 @@ function installedVersion() {
         encoding: 'utf8',
         env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
         stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 20_000,
       },
-    ).trim() || '0.30.0';
+    ).trim() || null;
   } catch {
-    return '0.30.0';
+    return null;
   }
+}
+
+function isTestedClientVersion(version) {
+  return TESTED_CLIENT_VERSIONS.includes(version);
+}
+
+function hasCredentialShape(credentials) {
+  return typeof credentials?.accessToken === 'string'
+    && credentials.accessToken.length > 0
+    && typeof credentials?.refreshToken === 'string'
+    && credentials.refreshToken.length > 0;
+}
+
+function probeDaemonEntry() {
+  execFileSync(
+    APP_BINARY,
+    ['-e', `require.resolve(${JSON.stringify(DAEMON_SCRIPT)})`],
+    {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      stdio: 'ignore',
+      timeout: 20_000,
+    },
+  );
+}
+
+async function compatibilityCheck(localOnly = false) {
+  await access(APP_BINARY);
+  await access(DAEMON_CONTAINER_PATH);
+  probeDaemonEntry();
+  if (!DETECTED_CLIENT_VERSION) {
+    throw new Error('Cannot read the installed Grok Bot version');
+  }
+
+  let authentication = 'skipped';
+  if (!localOnly) {
+    const credentials = await readJson(CREDENTIALS_PATH, false);
+    if (!hasCredentialShape(credentials)) {
+      throw new Error(`No valid account credentials. Run: ${process.argv[1]} login`);
+    }
+    await mintDescriptor();
+    authentication = 'verified';
+  }
+
+  process.stdout.write(`${JSON.stringify({
+    compatible: true,
+    installedVersion: DETECTED_CLIENT_VERSION,
+    testedVersion: isTestedClientVersion(DETECTED_CLIENT_VERSION),
+    daemonEntryPoint: 'verified',
+    authentication,
+  }, null, 2)}\n`);
 }
 
 function base64url(value) {
@@ -247,6 +302,9 @@ async function mintDescriptor() {
   let credentials = await readJson(CREDENTIALS_PATH, true).catch(() => {
     throw new Error(`No account credentials. Run: ${process.argv[1]} login`);
   });
+  if (!hasCredentialShape(credentials)) {
+    throw new Error(`Invalid account credentials. Run: ${process.argv[1]} login`);
+  }
   credentials = await refresh(credentials);
   const headers = commonHeaders(identity.machineId, credentials.accessToken, credentials.selectedTeamId);
 
@@ -436,9 +494,16 @@ async function main() {
     return run();
   }
   if (command === 'status') return status();
+  if (command === 'check') {
+    const option = process.argv[3];
+    if (option !== undefined && option !== '--local') {
+      throw new Error('Usage: grok-bot-headless check [--local]');
+    }
+    return compatibilityCheck(option === '--local');
+  }
   if (command === 'policy') return policy(process.argv[3]);
   if (command === 'logout') return logout();
-  process.stdout.write('Usage: grok-bot-headless <login|run|status|policy|logout>\n');
+  process.stdout.write('Usage: grok-bot-headless <login|run|status|check|policy|logout>\n');
   process.exitCode = command === 'help' ? 0 : 2;
 }
 
@@ -449,4 +514,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
 }
 
-export { accountScope, base64url, cursorChecksum, jwtPayload, tokenExpiresSoon, trimSlash, validatedServiceUrl };
+export {
+  accountScope,
+  base64url,
+  cursorChecksum,
+  hasCredentialShape,
+  isTestedClientVersion,
+  jwtPayload,
+  tokenExpiresSoon,
+  trimSlash,
+  validatedServiceUrl,
+};
