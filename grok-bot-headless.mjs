@@ -452,17 +452,50 @@ function processAlive(pid) {
   }
 }
 
+async function syncMachinePolicy(value, identity, credentials, connect = connectUnary) {
+  await connect(
+    'aiserver.v1.DashboardService',
+    'RegisterSandMachine',
+    { label: identity.label, localToolPermission: value },
+    credentials,
+    identity.machineId,
+  );
+  const response = await connect(
+    'aiserver.v1.DashboardService',
+    'UpdateSandMachineLocalToolPermission',
+    { machineId: identity.machineId, localToolPermission: value },
+    credentials,
+    identity.machineId,
+  );
+  if (response.machine?.machineId !== identity.machineId) {
+    throw new Error('Machine permission update returned an invalid machine');
+  }
+  if (response.machine.localToolPermission !== value) {
+    throw new Error(`The backend limited the machine policy to ${response.machine.localToolPermission || 'ask'}`);
+  }
+  return response.machine;
+}
+
 async function policy(value) {
   if (!['always', 'ask', 'never'].includes(value)) {
     throw new Error('Policy must be one of: always, ask, never');
   }
+  const identity = await machineIdentity();
+  let credentials = await readJson(CREDENTIALS_PATH, true).catch(() => {
+    throw new Error(`No account credentials. Run: ${process.argv[1]} login`);
+  });
+  if (!hasCredentialShape(credentials)) {
+    throw new Error(`Invalid account credentials. Run: ${process.argv[1]} login`);
+  }
+  credentials = await refresh(credentials);
+  await syncMachinePolicy(value, identity, credentials);
   const current = await readJson(SETTINGS_PATH, false);
   await atomicJson(SETTINGS_PATH, {
     ...(current && typeof current === 'object' ? current : {}),
     version: 1,
     localToolPermission: value,
   });
-  process.stdout.write(`Local execution policy set to ${value}. Restart the service to apply it.\n`);
+  process.stdout.write(`Local and backend execution policy set to ${value}. Restart the service to apply it locally.\n`);
 }
 
 async function logout() {
@@ -522,6 +555,7 @@ export {
   isTestedClientVersion,
   jwtPayload,
   tokenExpiresSoon,
+  syncMachinePolicy,
   trimSlash,
   validatedServiceUrl,
 };

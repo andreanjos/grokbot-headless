@@ -155,7 +155,7 @@ sudo loginctl enable-linger "$USER"
 
 ## Execution policy
 
-The policy controls how the official daemon handles local tool requests.
+The policy controls how the official daemon handles local tool requests. The command registers the machine and synchronizes the same policy with the backend machine roster.
 
 | Policy | Behavior | Recommended use |
 | --- | --- | --- |

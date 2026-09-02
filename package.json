@@ -1,6 +1,6 @@
 {
   "name": "grok-bot-headless-node",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Unofficial native headless controller for the Grok Bot local-computer daemon",
   "private": true,
   "type": "module",
