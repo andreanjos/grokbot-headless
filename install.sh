@@ -9,11 +9,6 @@ config_dir="${HOME}/.config/grok-bot-headless"
 environment_path="${config_dir}/environment"
 app_bin="${GROK_BOT_BINARY:-/opt/Grok Bot/grok-bot}"
 daemon_script="${GROK_BOT_DAEMON_SCRIPT:-/opt/Grok Bot/resources/app.asar/dist/local-exec-daemon/main.cjs}"
-if [[ "$daemon_script" == *.asar/* ]]; then
-  daemon_container="${daemon_script%%.asar/*}.asar"
-else
-  daemon_container="$daemon_script"
-fi
 if [[ "$app_bin" == *$'\n'* || "$app_bin" == *$'\r'* || "$daemon_script" == *$'\n'* || "$daemon_script" == *$'\r'* ]]; then
   printf 'Error: application paths cannot contain line breaks.\n' >&2
   exit 1
@@ -28,16 +23,12 @@ if (( node_major < 20 )); then
   printf 'Error: Node.js 20 or newer is required; found %s.\n' "$(node --version)" >&2
   exit 1
 fi
-if [[ ! -x "$app_bin" || ! -f "$daemon_container" ]]; then
-  printf 'Error: the official Grok Bot Linux application was not found.\n' >&2
-  printf 'Expected binary: %s\nExpected daemon: %s\n' "$app_bin" "$daemon_script" >&2
+printf 'Checking Grok Bot compatibility...\n'
+if ! GROK_BOT_BINARY="$app_bin" GROK_BOT_DAEMON_SCRIPT="$daemon_script" \
+  node "$repo_dir/grok-bot-headless.mjs" check --local; then
   printf 'Install Grok Bot first, or set GROK_BOT_BINARY and GROK_BOT_DAEMON_SCRIPT.\n' >&2
   exit 1
 fi
-printf 'Checking Grok Bot compatibility...\n'
-GROK_BOT_BINARY="$app_bin" \
-GROK_BOT_DAEMON_SCRIPT="$daemon_script" \
-  node "$repo_dir/grok-bot-headless.mjs" check --local
 
 mkdir -p "$bin_dir" "$lib_dir" "$unit_dir" "$config_dir"
 chmod 0700 "$config_dir"

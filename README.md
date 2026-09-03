@@ -155,7 +155,7 @@ sudo loginctl enable-linger "$USER"
 
 ## Execution policy
 
-The policy controls how the official daemon handles local tool requests. The command registers the machine and synchronizes the same policy with the backend machine roster.
+The policy controls how the official daemon handles local tool requests. The command registers the machine and synchronizes the same policy with the backend machine roster. Run it once after `login` and before the first service start. It is the only command that registers the machine.
 
 | Policy | Behavior | Recommended use |
 | --- | --- | --- |
@@ -202,7 +202,7 @@ The full check:
 3. Resolves the expected daemon entry point from the installed archive.
 4. Validates the saved OAuth credential format.
 5. Refreshes OAuth credentials when required.
-6. Requests both required runtime credentials from the current backend.
+6. Requests both required runtime credentials from the current backend and writes them to the runtime data directory. A running service replaces this file again at its next renewal.
 
 It does not send a shell command or file request through Grok Bot.
 
@@ -459,7 +459,7 @@ bash -n install.sh uninstall.sh bin/grok-bot-headless test/install.test.sh
 systemd-analyze --user verify grok-bot-headless.service
 ```
 
-The test suite includes pure protocol-helper tests and an isolated installer test. The installer test uses fake application and systemd commands. It does not contact Grok Bot.
+The test suite includes pure protocol-helper tests, an isolated installer test, and an end-to-end test. The end-to-end test runs the CLI against a fake backend server and a fake daemon on the loopback interface. The tests use fake application and systemd commands. They do not contact Grok Bot.
 
 Before you submit a change:
 

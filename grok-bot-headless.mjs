@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, fork } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+// --- Configuration -----------------------------------------------------------
+
+const CLI_NAME = 'grok-bot-headless';
+const SERVICE_UNIT = 'grok-bot-headless.service';
 const API_URL = validatedServiceUrl(
   process.env.SAND_BACKEND_URL || process.env.CURSOR_API_BASE_URL || 'https://api2.cursor.sh',
   'backend',
@@ -30,17 +35,16 @@ const DAEMON_CONTAINER_PATH = DAEMON_SCRIPT.includes('.asar/')
   : DAEMON_SCRIPT;
 const PACKAGE_JSON_PATH = process.env.GROK_BOT_PACKAGE_JSON || join(dirname(APP_BINARY), 'resources', 'app.asar', 'package.json');
 const TESTED_CLIENT_VERSIONS = Object.freeze(['0.30.0']);
-const DETECTED_CLIENT_VERSION = installedVersion();
-const CLIENT_VERSION = process.env.SAND_CLIENT_APP_VERSION
-  || DETECTED_CLIENT_VERSION
-  || TESTED_CLIENT_VERSIONS[TESTED_CLIENT_VERSIONS.length - 1];
+const POLICIES = Object.freeze(['always', 'ask', 'never']);
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const DESCRIPTOR_REFRESH_MS = 60 * 1000;
 const HEARTBEAT_MS = 20 * 1000;
+const DAEMON_RESTART_MS = 5 * 1000;
+const DAEMON_STOP_GRACE_MS = 5 * 1000;
+const LOGIN_POLL_ATTEMPTS = 150;
+const LOGIN_POLL_MAX_MS = 10 * 1000;
+const SUBPROCESS_TIMEOUT_MS = 20 * 1000;
 
-function trimSlash(value) {
-  return value.replace(/\/+$/, '');
-}
 function validatedServiceUrl(value, label) {
   let parsed;
   try {
@@ -51,86 +55,28 @@ function validatedServiceUrl(value, label) {
   if (parsed.username || parsed.password) {
     throw new Error(`${label} URL cannot contain credentials`);
   }
-  const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname);
   const insecureLocalAllowed = process.env.GROK_BOT_ALLOW_INSECURE_LOCALHOST === '1'
     && parsed.protocol === 'http:'
-    && isLocalhost;
+    && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
   if (parsed.protocol !== 'https:' && !insecureLocalAllowed) {
     throw new Error(`${label} URL must use HTTPS`);
   }
-  return trimSlash(parsed.href);
+  return parsed.href.replace(/\/+$/, '');
 }
 
+// --- Pure helpers ------------------------------------------------------------
 
-function installedVersion() {
-  try {
-    return execFileSync(
-      APP_BINARY,
-      ['-e', `process.stdout.write(require(${JSON.stringify(PACKAGE_JSON_PATH)}).version)`],
-      {
-        encoding: 'utf8',
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 20_000,
-      },
-    ).trim() || null;
-  } catch {
-    return null;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const formatJson = (value) => `${JSON.stringify(value, null, 2)}\n`;
+const printJson = (value) => process.stdout.write(formatJson(value));
+const base64url = (value) => Buffer.from(value).toString('base64url');
+
+function describeError(error) {
+  const messages = [];
+  for (let current = error; current; current = current.cause) {
+    messages.push(current.message || String(current));
   }
-}
-
-function isTestedClientVersion(version) {
-  return TESTED_CLIENT_VERSIONS.includes(version);
-}
-
-function hasCredentialShape(credentials) {
-  return typeof credentials?.accessToken === 'string'
-    && credentials.accessToken.length > 0
-    && typeof credentials?.refreshToken === 'string'
-    && credentials.refreshToken.length > 0;
-}
-
-function probeDaemonEntry() {
-  execFileSync(
-    APP_BINARY,
-    ['-e', `require.resolve(${JSON.stringify(DAEMON_SCRIPT)})`],
-    {
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-      stdio: 'ignore',
-      timeout: 20_000,
-    },
-  );
-}
-
-async function compatibilityCheck(localOnly = false) {
-  await access(APP_BINARY);
-  await access(DAEMON_CONTAINER_PATH);
-  probeDaemonEntry();
-  if (!DETECTED_CLIENT_VERSION) {
-    throw new Error('Cannot read the installed Grok Bot version');
-  }
-
-  let authentication = 'skipped';
-  if (!localOnly) {
-    const credentials = await readJson(CREDENTIALS_PATH, false);
-    if (!hasCredentialShape(credentials)) {
-      throw new Error(`No valid account credentials. Run: ${process.argv[1]} login`);
-    }
-    await mintDescriptor();
-    authentication = 'verified';
-  }
-
-  process.stdout.write(`${JSON.stringify({
-    compatible: true,
-    installedVersion: DETECTED_CLIENT_VERSION,
-    testedVersion: isTestedClientVersion(DETECTED_CLIENT_VERSION),
-    daemonEntryPoint: 'verified',
-    authentication,
-  }, null, 2)}\n`);
-}
-
-function base64url(value) {
-  return Buffer.from(value).toString('base64url');
+  return messages.join(': ');
 }
 
 function jwtPayload(token) {
@@ -170,38 +116,156 @@ function cursorChecksum(machineId, nowMs = Date.now()) {
   return `${bytes.toString('base64url')}${machineId}`;
 }
 
-async function atomicJson(path, value, mode = 0o600) {
+function isTestedClientVersion(version) {
+  return TESTED_CLIENT_VERSIONS.includes(version);
+}
+
+function hasCredentialShape(credentials) {
+  return typeof credentials?.accessToken === 'string'
+    && credentials.accessToken.length > 0
+    && typeof credentials?.refreshToken === 'string'
+    && credentials.refreshToken.length > 0;
+}
+
+function oauthTokens(body) {
+  return {
+    accessToken: body.accessToken || body.access_token,
+    refreshToken: body.refreshToken || body.refresh_token,
+  };
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// --- Local files -------------------------------------------------------------
+
+async function atomicJson(path, value) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode });
-  await chmod(temporary, mode);
+  await writeFile(temporary, formatJson(value), { mode: 0o600 });
+  await chmod(temporary, 0o600);
   await rename(temporary, path);
 }
 
-async function readJson(path, required = true) {
+async function readJson(path) {
   try {
     return JSON.parse(await readFile(path, 'utf8'));
   } catch (error) {
-    if (!required && error?.code === 'ENOENT') return null;
-    throw error;
+    if (error?.code === 'ENOENT') return null;
+    throw new Error(`Cannot read ${path}`, { cause: error });
   }
 }
 
 async function machineIdentity() {
-  const current = await readJson(MACHINE_PATH, false);
+  const current = await readJson(MACHINE_PATH);
   if (typeof current?.machineId === 'string' && current.machineId.length > 0) return current;
   const created = { machineId: randomUUID(), label: hostname() };
   await atomicJson(MACHINE_PATH, created);
   return created;
 }
 
-function commonHeaders(machineId, accessToken, teamId) {
+async function saveCredentials(credentials) {
+  const saved = { ...credentials, savedAtMs: Date.now() };
+  await atomicJson(CREDENTIALS_PATH, saved);
+  return saved;
+}
+
+async function loadCredentials() {
+  const credentials = await readJson(CREDENTIALS_PATH);
+  if (!hasCredentialShape(credentials)) {
+    throw new Error(`No valid account credentials. Run: ${CLI_NAME} login`);
+  }
+  return refresh(credentials);
+}
+
+const heartbeat = () => atomicJson(HEARTBEAT_PATH, { pid: process.pid, at: Date.now() });
+
+// --- Official application ----------------------------------------------------
+
+function appNode(code) {
+  return execFileSync(APP_BINARY, ['-e', code], {
+    encoding: 'utf8',
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: SUBPROCESS_TIMEOUT_MS,
+  });
+}
+
+let installedVersionCache;
+function installedVersion() {
+  if (installedVersionCache === undefined) {
+    try {
+      installedVersionCache = appNode(`process.stdout.write(require(${JSON.stringify(PACKAGE_JSON_PATH)}).version)`).trim() || null;
+    } catch {
+      installedVersionCache = null;
+    }
+  }
+  return installedVersionCache;
+}
+
+function clientVersion() {
+  return process.env.SAND_CLIENT_APP_VERSION || installedVersion() || TESTED_CLIENT_VERSIONS.at(-1);
+}
+
+function probeDaemonEntry() {
+  appNode(`require.resolve(${JSON.stringify(DAEMON_SCRIPT)})`);
+}
+
+async function assertAppInstalled() {
+  for (const [label, path] of [['application binary', APP_BINARY], ['daemon archive', DAEMON_CONTAINER_PATH]]) {
+    await access(path).catch((error) => {
+      throw new Error(`Cannot access the Grok Bot ${label}: ${path}`, { cause: error });
+    });
+  }
+}
+
+function spawnDaemon(machineId) {
+  const child = fork(DAEMON_SCRIPT, [], {
+    execPath: APP_BINARY,
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      SAND_PACKAGED: '1',
+      SAND_DATA_ROOT: DATA_ROOT,
+      SAND_CLIENT_APP_VERSION: clientVersion(),
+    },
+    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+  });
+  child.once('spawn', () => {
+    child.send({ type: 'sand-local-exec-file-key', key: null, computerId: machineId });
+  });
+  return child;
+}
+
+async function terminate(child) {
+  const exited = child.exitCode !== null || child.signalCode !== null
+    ? Promise.resolve()
+    : new Promise((resolve) => child.once('exit', resolve));
+  const exitedWithin = (ms) => Promise.race([exited.then(() => true), sleep(ms).then(() => false)]);
+  if (child.connected) child.disconnect();
+  child.kill('SIGTERM');
+  if (!(await exitedWithin(DAEMON_STOP_GRACE_MS))) {
+    child.kill('SIGKILL');
+    await exitedWithin(1000);
+  }
+}
+
+// --- Backend protocol --------------------------------------------------------
+
+function authHeaders(machineId, credentials) {
+  const teamId = credentials.selectedTeamId;
   return {
-    authorization: `Bearer ${accessToken}`,
+    authorization: `Bearer ${credentials.accessToken}`,
     ...(teamId == null || teamId === '' ? {} : { 'x-cursor-team-id': String(teamId) }),
     'x-cursor-checksum': cursorChecksum(machineId),
     'x-cursor-client-type': 'sand',
-    'x-cursor-client-version': CLIENT_VERSION,
+    'x-cursor-client-version': clientVersion(),
     'x-sand-box-namespace': 'prod',
     'x-ghost-mode': 'true',
     'x-request-id': randomUUID(),
@@ -222,234 +286,58 @@ async function responseJson(response, action) {
   return body;
 }
 
-async function login() {
-  const verifier = base64url(randomBytes(32));
-  const challenge = base64url(createHash('sha256').update(verifier).digest());
-  const uuid = randomUUID();
-  const loginUrl = new URL('/loginDeepControl', WEBSITE_URL);
-  loginUrl.searchParams.set('challenge', challenge);
-  loginUrl.searchParams.set('uuid', uuid);
-  loginUrl.searchParams.set('mode', 'login');
-  loginUrl.searchParams.set('redirectTarget', 'sand');
-  loginUrl.searchParams.set('supportsSelectedTeamLogin', 'true');
-  process.stdout.write(`Open this URL in any browser and complete sign-in:\n\n${loginUrl}\n\nWaiting for authorization...\n`);
+async function postJson(path, body, action, headers = {}) {
+  const response = await fetch(`${API_URL}${path}`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return responseJson(response, action);
+}
 
-  let delay = 1000;
-  for (let attempt = 0; attempt < 150; attempt += 1) {
-    const pollUrl = new URL('/auth/poll', API_URL);
-    pollUrl.searchParams.set('uuid', uuid);
-    pollUrl.searchParams.set('verifier', verifier);
-    const response = await fetch(pollUrl, { headers: { 'content-type': 'application/json' } });
-    if (response.status === 404) {
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(Math.floor(delay * 1.2), 10_000);
-      continue;
-    }
-    const body = await responseJson(response, 'OAuth poll');
-    const accessToken = body.accessToken || body.access_token;
-    const refreshToken = body.refreshToken || body.refresh_token;
-    if (!accessToken || !refreshToken) throw new Error('OAuth response did not contain access and refresh tokens');
-    await atomicJson(CREDENTIALS_PATH, {
-      accessToken,
-      refreshToken,
-      ...(body.selectedTeamId == null ? {} : { selectedTeamId: body.selectedTeamId }),
-      savedAtMs: Date.now(),
-    });
-    process.stdout.write(`Account authorized for ${hostname()}.\n`);
-    return;
-  }
-  throw new Error('OAuth sign-in timed out');
+function connectUnary(service, method, request, credentials, machineId) {
+  const headers = { ...authHeaders(machineId, credentials), 'connect-protocol-version': '1' };
+  return postJson(`/${service}/${method}`, request, method, headers);
 }
 
 async function refresh(credentials) {
   if (!tokenExpiresSoon(credentials.accessToken)) return credentials;
-  const response = await fetch(new URL('/oauth/token', API_URL), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      client_id: AUTH_CLIENT_ID,
-      grant_type: 'refresh_token',
-      refresh_token: credentials.refreshToken,
-    }),
-  });
-  const body = await responseJson(response, 'OAuth refresh');
+  const body = await postJson('/oauth/token', {
+    client_id: AUTH_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: credentials.refreshToken,
+  }, 'OAuth refresh');
   if (body.shouldLogout) throw new Error('OAuth refresh requires a new sign-in');
-  const next = {
+  const tokens = oauthTokens(body);
+  return saveCredentials({
     ...credentials,
-    accessToken: body.access_token || body.accessToken || credentials.accessToken,
-    refreshToken: body.refresh_token || body.refreshToken || credentials.refreshToken,
-    savedAtMs: Date.now(),
-  };
-  await atomicJson(CREDENTIALS_PATH, next);
-  return next;
+    accessToken: tokens.accessToken || credentials.accessToken,
+    refreshToken: tokens.refreshToken || credentials.refreshToken,
+  });
 }
 
-async function connectUnary(service, method, request, credentials, machineId) {
-  const response = await fetch(`${API_URL}/${service}/${method}`, {
-    method: 'POST',
-    headers: {
-      ...commonHeaders(machineId, credentials.accessToken, credentials.selectedTeamId),
-      'content-type': 'application/json',
-      'connect-protocol-version': '1',
-    },
-    body: JSON.stringify(request),
-  });
-  return responseJson(response, method);
-}
-
-async function mintDescriptor() {
-  const identity = await machineIdentity();
-  let credentials = await readJson(CREDENTIALS_PATH, true).catch(() => {
-    throw new Error(`No account credentials. Run: ${process.argv[1]} login`);
-  });
-  if (!hasCredentialShape(credentials)) {
-    throw new Error(`Invalid account credentials. Run: ${process.argv[1]} login`);
-  }
-  credentials = await refresh(credentials);
-  const headers = commonHeaders(identity.machineId, credentials.accessToken, credentials.selectedTeamId);
-
-  const [daemonResponse, computerResponse] = await Promise.all([
-    fetch(new URL('/sand-box/local-exec-daemon-credential', API_URL), {
-      method: 'POST',
-      headers: { ...headers, 'content-type': 'application/json' },
-      body: '{}',
-    }).then((response) => responseJson(response, 'Local daemon credential mint')),
-    connectUnary(
-      'aiserver.v1.GrokBotService',
-      'IssueGrokBotUserComputerCredential',
-      { machineId: identity.machineId },
-      credentials,
-      identity.machineId,
-    ),
+async function mintDescriptor(identity, credentials) {
+  const { machineId } = identity;
+  const [daemon, computer] = await Promise.all([
+    postJson('/sand-box/local-exec-daemon-credential', {}, 'Local daemon credential mint', authHeaders(machineId, credentials)),
+    connectUnary('aiserver.v1.GrokBotService', 'IssueGrokBotUserComputerCredential', { machineId }, credentials, machineId),
   ]);
-
-  if (!daemonResponse.credential) throw new Error('Daemon credential mint returned no credential');
-  if (!computerResponse.credential) throw new Error('User-computer credential mint returned no credential');
+  if (!daemon.credential) throw new Error('Daemon credential mint returned no credential');
+  if (!computer.credential) throw new Error('User-computer credential mint returned no credential');
   const descriptor = {
-    credential: daemonResponse.credential,
+    credential: daemon.credential,
     backendUrl: API_URL,
-    ...(typeof daemonResponse.expiresAtMs === 'number' ? { expiresAtMs: daemonResponse.expiresAtMs } : {}),
+    ...(typeof daemon.expiresAtMs === 'number' ? { expiresAtMs: daemon.expiresAtMs } : {}),
     userComputer: {
-      credential: computerResponse.credential,
-      machineId: identity.machineId,
-      expiresAtMs: Number(computerResponse.expiresAtMs),
+      credential: computer.credential,
+      machineId,
+      expiresAtMs: Number(computer.expiresAtMs),
       accountScope: accountScope(credentials.accessToken),
-      serverAuthoritative: computerResponse.serverAuthoritative === true,
+      serverAuthoritative: computer.serverAuthoritative === true,
     },
   };
   await atomicJson(DAEMON_CREDENTIAL_PATH, descriptor);
-  return { identity, descriptor };
-}
-
-async function heartbeat() {
-  await atomicJson(HEARTBEAT_PATH, { pid: process.pid, at: Date.now() });
-}
-
-function spawnDaemon(machineId) {
-  const child = fork(DAEMON_SCRIPT, [], {
-    execPath: APP_BINARY,
-    env: {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
-      SAND_PACKAGED: '1',
-      SAND_DATA_ROOT: DATA_ROOT,
-      SAND_CLIENT_APP_VERSION: CLIENT_VERSION,
-    },
-    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-  });
-  child.once('spawn', () => {
-    child.send({ type: 'sand-local-exec-file-key', key: null, computerId: machineId });
-  });
-  return child;
-}
-
-async function run() {
-  await mkdir(DATA_ROOT, { recursive: true, mode: 0o700 });
-  let { identity } = await mintDescriptor();
-  await heartbeat();
-  let stopping = false;
-  let refreshBusy = false;
-  let child;
-
-  const startDaemon = () => {
-    const daemon = spawnDaemon(identity.machineId);
-    daemon.on('exit', (code, signal) => {
-      if (stopping) return;
-      console.error(`local-exec daemon exited (${signal || code}); restarting in 5 seconds`);
-      setTimeout(() => {
-        if (!stopping) child = startDaemon();
-      }, 5000).unref();
-    });
-    return daemon;
-  };
-  child = startDaemon();
-
-  const heartbeatTimer = setInterval(() => heartbeat().catch((error) => console.error(`heartbeat: ${error.message}`)), HEARTBEAT_MS);
-  const refreshTimer = setInterval(async () => {
-    if (refreshBusy) return;
-    refreshBusy = true;
-    try {
-      ({ identity } = await mintDescriptor());
-    } catch (error) {
-      console.error(`credential refresh: ${error.message}`);
-    } finally {
-      refreshBusy = false;
-    }
-  }, DESCRIPTOR_REFRESH_MS);
-
-  const stop = async (signal) => {
-    if (stopping) return;
-    stopping = true;
-    clearInterval(heartbeatTimer);
-    clearInterval(refreshTimer);
-    const exitPromise = child.exitCode !== null || child.signalCode !== null
-      ? Promise.resolve()
-      : new Promise((resolve) => child.once('exit', resolve));
-    if (child.connected) child.disconnect();
-    child.kill('SIGTERM');
-    const exited = await Promise.race([
-      exitPromise.then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 5000)),
-    ]);
-    if (!exited) {
-      child.kill('SIGKILL');
-      await Promise.race([
-        exitPromise,
-        new Promise((resolve) => setTimeout(resolve, 1000)),
-      ]);
-    }
-    await rm(HEARTBEAT_PATH, { force: true });
-    process.exit(signal === 'SIGINT' ? 130 : 0);
-  };
-  process.on('SIGINT', () => void stop('SIGINT'));
-  process.on('SIGTERM', () => void stop('SIGTERM'));
-  process.stdout.write(`Native Grok Bot node started: ${identity.label} (${identity.machineId})\n`);
-}
-
-async function status() {
-  const identity = await readJson(MACHINE_PATH, false);
-  const discovery = await readJson(DISCOVERY_PATH, false);
-  const descriptor = await readJson(DAEMON_CREDENTIAL_PATH, false);
-  const settings = await readJson(SETTINGS_PATH, false);
-  const alive = discovery?.pid ? processAlive(discovery.pid) : false;
-  process.stdout.write(`${JSON.stringify({
-    label: identity?.label || hostname(),
-    machineId: identity?.machineId || null,
-    daemonPid: discovery?.pid || null,
-    daemonAlive: alive,
-    localToolPermission: settings?.localToolPermission || 'ask',
-    credentialExpiresAtMs: descriptor?.userComputer?.expiresAtMs || descriptor?.expiresAtMs || null,
-    dataRoot: DATA_ROOT,
-  }, null, 2)}\n`);
-}
-
-function processAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return descriptor;
 }
 
 async function syncMachinePolicy(value, identity, credentials, connect = connectUnary) {
@@ -476,20 +364,135 @@ async function syncMachinePolicy(value, identity, credentials, connect = connect
   return response.machine;
 }
 
+// --- Commands ----------------------------------------------------------------
+
+async function login() {
+  const verifier = base64url(randomBytes(32));
+  const challenge = base64url(createHash('sha256').update(verifier).digest());
+  const uuid = randomUUID();
+  const loginUrl = new URL('/loginDeepControl', WEBSITE_URL);
+  loginUrl.search = new URLSearchParams({
+    challenge,
+    uuid,
+    mode: 'login',
+    redirectTarget: 'sand',
+    supportsSelectedTeamLogin: 'true',
+  });
+  process.stdout.write(`Open this URL in any browser and complete sign-in:\n\n${loginUrl}\n\nWaiting for authorization...\n`);
+
+  const pollUrl = new URL(`${API_URL}/auth/poll`);
+  pollUrl.search = new URLSearchParams({ uuid, verifier });
+  let delay = 1000;
+  for (let attempt = 0; attempt < LOGIN_POLL_ATTEMPTS; attempt += 1) {
+    const response = await fetch(pollUrl);
+    if (response.status !== 404) {
+      const body = await responseJson(response, 'OAuth poll');
+      const tokens = oauthTokens(body);
+      if (!tokens.accessToken || !tokens.refreshToken) {
+        throw new Error('OAuth response did not contain access and refresh tokens');
+      }
+      await saveCredentials({
+        ...tokens,
+        ...(body.selectedTeamId == null ? {} : { selectedTeamId: body.selectedTeamId }),
+      });
+      process.stdout.write(`Account authorized for ${hostname()}.\n`);
+      return;
+    }
+    await sleep(delay);
+    delay = Math.min(Math.floor(delay * 1.2), LOGIN_POLL_MAX_MS);
+  }
+  throw new Error('OAuth sign-in timed out');
+}
+
+async function localCompatibility() {
+  await assertAppInstalled();
+  probeDaemonEntry();
+  const version = installedVersion();
+  if (!version) throw new Error('Cannot read the installed Grok Bot version');
+  return {
+    compatible: true,
+    installedVersion: version,
+    testedVersion: isTestedClientVersion(version),
+    daemonEntryPoint: 'verified',
+  };
+}
+
+async function check(localOnly) {
+  const report = await localCompatibility();
+  if (!localOnly) await mintDescriptor(await machineIdentity(), await loadCredentials());
+  printJson({ ...report, authentication: localOnly ? 'skipped' : 'verified' });
+}
+
+async function run() {
+  await assertAppInstalled();
+  await mkdir(DATA_ROOT, { recursive: true, mode: 0o700 });
+  const identity = await machineIdentity();
+  let stopping = false;
+  let daemon;
+
+  const renewCredentials = async () => mintDescriptor(identity, await loadCredentials());
+
+  const startDaemon = () => {
+    const child = spawnDaemon(identity.machineId);
+    child.on('exit', (code, signal) => {
+      if (stopping) return;
+      console.error(`local-exec daemon exited (${signal || code}); restarting in ${DAEMON_RESTART_MS / 1000} seconds`);
+      setTimeout(() => {
+        if (!stopping) daemon = startDaemon();
+      }, DAEMON_RESTART_MS).unref();
+    });
+    return child;
+  };
+
+  const repeat = async (intervalMs, label, work) => {
+    while (!stopping) {
+      await sleep(intervalMs);
+      if (stopping) return;
+      await work().catch((error) => console.error(`${label}: ${describeError(error)}`));
+    }
+  };
+
+  const stop = async (signal) => {
+    if (stopping) return;
+    stopping = true;
+    await terminate(daemon);
+    await rm(HEARTBEAT_PATH, { force: true });
+    process.exit(signal === 'SIGINT' ? 130 : 0);
+  };
+
+  await renewCredentials();
+  await heartbeat();
+  daemon = startDaemon();
+  void repeat(HEARTBEAT_MS, 'heartbeat', heartbeat);
+  void repeat(DESCRIPTOR_REFRESH_MS, 'credential refresh', renewCredentials);
+  process.on('SIGINT', () => void stop('SIGINT'));
+  process.on('SIGTERM', () => void stop('SIGTERM'));
+  process.stdout.write(`Native Grok Bot node started: ${identity.label} (${identity.machineId})\n`);
+}
+
+async function status() {
+  const [identity, discovery, descriptor, settings] = await Promise.all(
+    [MACHINE_PATH, DISCOVERY_PATH, DAEMON_CREDENTIAL_PATH, SETTINGS_PATH].map((path) => readJson(path)),
+  );
+  printJson({
+    label: identity?.label || hostname(),
+    machineId: identity?.machineId || null,
+    daemonPid: discovery?.pid || null,
+    daemonAlive: discovery?.pid ? processAlive(discovery.pid) : false,
+    localToolPermission: settings?.localToolPermission || 'ask',
+    credentialExpiresAtMs: descriptor?.userComputer?.expiresAtMs || descriptor?.expiresAtMs || null,
+    dataRoot: DATA_ROOT,
+  });
+}
+
 async function policy(value) {
-  if (!['always', 'ask', 'never'].includes(value)) {
-    throw new Error('Policy must be one of: always, ask, never');
+  if (!POLICIES.includes(value)) {
+    throw new Error(`Policy must be one of: ${POLICIES.join(', ')}`);
   }
   const identity = await machineIdentity();
-  let credentials = await readJson(CREDENTIALS_PATH, true).catch(() => {
-    throw new Error(`No account credentials. Run: ${process.argv[1]} login`);
-  });
-  if (!hasCredentialShape(credentials)) {
-    throw new Error(`Invalid account credentials. Run: ${process.argv[1]} login`);
-  }
-  credentials = await refresh(credentials);
+  const credentials = await loadCredentials();
   await syncMachinePolicy(value, identity, credentials);
-  const current = await readJson(SETTINGS_PATH, false);
+  const current = await readJson(SETTINGS_PATH);
   await atomicJson(SETTINGS_PATH, {
     ...(current && typeof current === 'object' ? current : {}),
     version: 1,
@@ -500,49 +503,52 @@ async function policy(value) {
 
 async function logout() {
   try {
-    execFileSync('systemctl', ['--user', 'stop', 'grok-bot-headless.service'], {
-      stdio: 'ignore',
-      timeout: 20_000,
-    });
+    execFileSync('systemctl', ['--user', 'stop', SERVICE_UNIT], { stdio: 'ignore', timeout: SUBPROCESS_TIMEOUT_MS });
   } catch {
     // A direct run or an unavailable user service is handled by the process check below.
   }
-  const discovery = await readJson(DISCOVERY_PATH, false);
+  const discovery = await readJson(DISCOVERY_PATH);
   if (discovery?.pid && processAlive(discovery.pid)) {
     throw new Error('The local execution daemon is still active. Stop it before logout');
   }
-  await rm(CREDENTIALS_PATH, { force: true });
-  await rm(DAEMON_CREDENTIAL_PATH, { force: true });
-  await rm(DISCOVERY_PATH, { force: true });
-  await rm(HEARTBEAT_PATH, { force: true });
+  await Promise.all(
+    [CREDENTIALS_PATH, DAEMON_CREDENTIAL_PATH, DISCOVERY_PATH, HEARTBEAT_PATH].map((path) => rm(path, { force: true })),
+  );
   process.stdout.write('Local service stopped and credentials removed.\n');
 }
 
-async function main() {
-  const command = process.argv[2] || 'help';
-  if (command === 'login') return login();
-  if (command === 'run') {
-    await access(APP_BINARY);
-    await access(DAEMON_CONTAINER_PATH);
-    return run();
+// --- Entry point -------------------------------------------------------------
+
+async function main(command, option) {
+  switch (command) {
+    case 'login': return login();
+    case 'run': return run();
+    case 'status': return status();
+    case 'check':
+      if (option !== undefined && option !== '--local') throw new Error(`Usage: ${CLI_NAME} check [--local]`);
+      return check(option === '--local');
+    case 'policy': return policy(option);
+    case 'logout': return logout();
+    default:
+      process.stdout.write(`Usage: ${CLI_NAME} <login|run|status|check|policy|logout>\n`);
+      process.exitCode = command === 'help' ? 0 : 2;
+      return undefined;
   }
-  if (command === 'status') return status();
-  if (command === 'check') {
-    const option = process.argv[3];
-    if (option !== undefined && option !== '--local') {
-      throw new Error('Usage: grok-bot-headless check [--local]');
-    }
-    return compatibilityCheck(option === '--local');
-  }
-  if (command === 'policy') return policy(process.argv[3]);
-  if (command === 'logout') return logout();
-  process.stdout.write('Usage: grok-bot-headless <login|run|status|check|policy|logout>\n');
-  process.exitCode = command === 'help' ? 0 : 2;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => {
-    console.error(`grok-bot-headless: ${error.stack || error.message || error}`);
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    // import.meta.url is the real path; argv[1] can be a symlink (for example a symlinked $HOME).
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  main(process.argv[2] || 'help', process.argv[3]).catch((error) => {
+    console.error(`${CLI_NAME}: ${describeError(error)}`);
     process.exitCode = 1;
   });
 }
@@ -556,6 +562,5 @@ export {
   jwtPayload,
   tokenExpiresSoon,
   syncMachinePolicy,
-  trimSlash,
   validatedServiceUrl,
 };

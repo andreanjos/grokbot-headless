@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   accountScope,
@@ -9,15 +14,11 @@ import {
   isTestedClientVersion,
   jwtPayload,
   syncMachinePolicy,
-  trimSlash,
+  tokenExpiresSoon,
   validatedServiceUrl,
 } from '../grok-bot-headless.mjs';
 
-test('trimSlash removes all trailing slashes', () => {
-  assert.equal(trimSlash('https://api.example.test///'), 'https://api.example.test');
-});
-
-test('service URLs require HTTPS and reject embedded credentials', () => {
+test('service URLs require HTTPS, drop trailing slashes, and reject embedded credentials', () => {
   assert.equal(validatedServiceUrl('https://api.example.test///', 'backend'), 'https://api.example.test');
   assert.throws(
     () => validatedServiceUrl('http://api.example.test', 'backend'),
@@ -27,6 +28,29 @@ test('service URLs require HTTPS and reject embedded credentials', () => {
     () => validatedServiceUrl('https://user:secret@api.example.test', 'backend'),
     /backend URL cannot contain credentials/,
   );
+});
+
+test('plain HTTP is allowed for loopback hosts only with the explicit opt-in', () => {
+  assert.throws(() => validatedServiceUrl('http://127.0.0.1:8080', 'backend'), /must use HTTPS/);
+  process.env.GROK_BOT_ALLOW_INSECURE_LOCALHOST = '1';
+  try {
+    assert.equal(validatedServiceUrl('http://localhost:8080/', 'backend'), 'http://localhost:8080');
+    assert.equal(validatedServiceUrl('http://127.0.0.1:8080', 'backend'), 'http://127.0.0.1:8080');
+    assert.equal(validatedServiceUrl('http://[::1]:8080', 'backend'), 'http://[::1]:8080');
+    assert.throws(() => validatedServiceUrl('http://api.example.test', 'backend'), /must use HTTPS/);
+  } finally {
+    delete process.env.GROK_BOT_ALLOW_INSECURE_LOCALHOST;
+  }
+});
+
+test('access tokens expire soon inside the refresh margin or without an exp claim', () => {
+  const token = (payload) => `header.${base64url(JSON.stringify(payload))}.signature`;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  assert.equal(tokenExpiresSoon(token({ exp: nowSeconds + 3600 })), false);
+  assert.equal(tokenExpiresSoon(token({ exp: nowSeconds + 60 })), true);
+  assert.equal(tokenExpiresSoon(token({ exp: nowSeconds - 60 })), true);
+  assert.equal(tokenExpiresSoon(token({})), true);
+  assert.equal(tokenExpiresSoon('not-a-jwt'), true);
 });
 
 test('base64url uses URL-safe encoding without padding', () => {
@@ -94,4 +118,16 @@ test('machine policy rejects a backend permission ceiling', async () => {
     ),
     /backend limited the machine policy to ask/,
   );
+});
+
+test('the CLI runs when its path contains a symlink', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grok-bot-headless-'));
+  try {
+    const link = join(directory, 'grok-bot-headless.mjs');
+    symlinkSync(fileURLToPath(new URL('../grok-bot-headless.mjs', import.meta.url)), link);
+    const output = execFileSync(process.execPath, [link, 'help'], { encoding: 'utf8' });
+    assert.match(output, /^Usage: grok-bot-headless/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
