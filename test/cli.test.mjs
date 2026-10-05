@@ -18,7 +18,13 @@ process.on('message', (bootstrap) => {
   const { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION } = process.env;
   fs.writeFileSync(
     path.join(process.env.SAND_DATA_ROOT, 'local-exec-daemon.json'),
-    JSON.stringify({ pid: process.pid, bootstrap, env: { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION } }),
+    JSON.stringify({
+      pid: process.pid,
+      bootstrap,
+      execPath: process.execPath,
+      script: process.argv[1],
+      env: { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION },
+    }),
   );
 });
 process.on('SIGTERM', () => process.exit(0));
@@ -113,6 +119,7 @@ test('the CLI drives the whole lifecycle against a fake backend and daemon', asy
     GROK_BOT_ALLOW_INSECURE_LOCALHOST: '1',
   };
   delete env.SAND_CLIENT_APP_VERSION;
+  delete env.ELECTRON_RUN_AS_NODE;
   const cli = (...args) => promisify(execFile)(process.execPath, [CLI, ...args], { env, encoding: 'utf8' });
   const paths = {
     credentials: join(configDir, 'credentials.json'),
@@ -208,12 +215,14 @@ test('the CLI drives the whole lifecycle against a fake backend and daemon', asy
         const machine = readJson(paths.machine);
         const discovery = await waitFor(() => existsSync(paths.discovery) && readJson(paths.discovery), 'daemon bootstrap');
         assert.deepEqual(discovery.bootstrap, { type: 'sand-local-exec-file-key', key: null, computerId: machine.machineId });
+        assert.equal(discovery.execPath, process.execPath);
+        assert.equal(discovery.script, join(appDir, 'daemon.cjs'));
         assert.deepEqual(discovery.env, {
-          ELECTRON_RUN_AS_NODE: '1',
           SAND_PACKAGED: '1',
           SAND_DATA_ROOT: dataRoot,
           SAND_CLIENT_APP_VERSION: '0.30.0',
         });
+        assert.equal(Object.hasOwn(discovery.env, 'ELECTRON_RUN_AS_NODE'), false);
         assert.equal(readJson(paths.heartbeat).pid, controller.pid);
 
         const status = JSON.parse((await cli('status')).stdout);

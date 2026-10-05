@@ -35,12 +35,26 @@ chmod 0700 "$config_dir"
 install -m 0755 "$repo_dir/grok-bot-headless.mjs" "$lib_dir/grok-bot-headless.mjs"
 install -m 0755 "$repo_dir/bin/grok-bot-headless" "$bin_dir/grok-bot-headless"
 install -m 0644 "$repo_dir/grok-bot-headless.service" "$unit_dir/grok-bot-headless.service"
+display="${DISPLAY:-:99}"
+if [[ "$PATH" == *$'\n'* || "$PATH" == *$'\r'* || "$display" == *$'\n'* || "$display" == *$'\r'* ]]; then
+  printf 'Error: PATH and DISPLAY cannot contain line breaks.\n' >&2
+  exit 1
+fi
+node_dir="$(dirname -- "$(command -v node)")"
+case ":$PATH:" in
+  *":$node_dir:"*) ;;
+  *) PATH="$node_dir:$PATH" ;;
+esac
 escaped_app_bin="${app_bin//\\/\\\\}"
 escaped_app_bin="${escaped_app_bin//\"/\\\"}"
 escaped_daemon_script="${daemon_script//\\/\\\\}"
 escaped_daemon_script="${escaped_daemon_script//\"/\\\"}"
-printf 'GROK_BOT_BINARY="%s"\nGROK_BOT_DAEMON_SCRIPT="%s"\n' \
-  "$escaped_app_bin" "$escaped_daemon_script" > "$environment_path"
+escaped_path="${PATH//\\/\\\\}"
+escaped_path="${escaped_path//\"/\\\"}"
+escaped_display="${display//\\/\\\\}"
+escaped_display="${escaped_display//\"/\\\"}"
+printf 'GROK_BOT_BINARY="%s"\nGROK_BOT_DAEMON_SCRIPT="%s"\nPATH="%s"\nDISPLAY="%s"\n' \
+  "$escaped_app_bin" "$escaped_daemon_script" "$escaped_path" "$escaped_display" > "$environment_path"
 chmod 0600 "$environment_path"
 systemctl --user daemon-reload
 systemctl --user enable grok-bot-headless.service

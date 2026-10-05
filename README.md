@@ -39,7 +39,7 @@ The official Grok Bot desktop application normally performs these tasks:
 5. Send startup data through Node IPC.
 6. Renew credentials and restart the daemon when necessary.
 
-This project performs only those management tasks. It starts the official daemon with `ELECTRON_RUN_AS_NODE=1`, which does not create an Electron window or renderer.
+This project performs only those management tasks. It starts the official `dist/local-exec-daemon/main.cjs` entry with the system Node binary (`process.execPath`), which does not create an Electron window or renderer. When that entry lives inside `app.asar`, the controller extracts it beside a `dist/deps` link to the package's unpacked natives.
 
 ```text
 Grok Bot service
@@ -93,7 +93,7 @@ The default application location is:
 /opt/Grok Bot
 ```
 
-The current compatibility data lists the official Grok Bot Linux package `0.30.0` as tested. A different version can still work if all structural and remote protocol checks pass.
+The current compatibility data lists the official Grok Bot Linux packages `0.30.0` and `0.66.0` as tested. A different version can still work if all structural and remote protocol checks pass.
 
 ## Quick start
 
@@ -152,6 +152,8 @@ The installer enables the user service. To let the user service start during boo
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
+
+A lingered user service does not inherit a login `PATH` or `DISPLAY`. The installer writes both into `~/.config/grok-bot-headless/environment` so `node` still resolves and an existing display stays available. If `DISPLAY` is unset at install time, the file uses `:99`.
 
 ## Execution policy
 
@@ -345,7 +347,7 @@ GROK_BOT_DAEMON_SCRIPT=/path/to/local-exec-daemon/main.cjs \
 ./install.sh
 ```
 
-The installer saves these paths in:
+The installer saves these paths, the install-time `PATH`, and `DISPLAY` in:
 
 ```text
 ~/.config/grok-bot-headless/environment
@@ -426,6 +428,10 @@ grok-bot-headless check
 ```
 
 If authentication has expired, run `grok-bot-headless login` again.
+
+### `exec: node: not found`
+
+The systemd user service runs `~/.local/bin/grok-bot-headless`, which starts with `exec node`. Re-run `./install.sh` so the environment file contains the `PATH` that locates `node`.
 
 ### The service does not start during boot
 
