@@ -187,6 +187,23 @@ systemctl --user restart grok-bot-headless
 
 `logout` refuses to remove credentials if a directly started daemon remains active. Stop that foreground process first.
 
+## Newer packages with RunAsNode disabled
+
+Recent official packages (verified with 0.78.1) ship with the Electron `RunAsNode` fuse turned off, so the app binary cannot run the daemon as plain Node.js. The daemon bundle only uses Node.js built-ins, so you can extract it and run it with a system Node.js 20 or newer instead. This does not modify the application.
+
+```bash
+dpkg-deb -x grok-bot_*.deb ~/grok-bot-app
+npx --yes @electron/asar extract "$HOME/grok-bot-app/opt/Grok Bot/resources/app.asar" ~/grok-bot-asar
+
+GROK_BOT_BINARY="$HOME/grok-bot-app/opt/Grok Bot/grok-bot" \
+GROK_BOT_NODE="$(command -v node)" \
+GROK_BOT_DAEMON_SCRIPT="$HOME/grok-bot-asar/dist/local-exec-daemon/main.cjs" \
+GROK_BOT_PACKAGE_JSON="$HOME/grok-bot-asar/package.json" \
+./install.sh
+```
+
+`GROK_BOT_NODE` replaces the app binary as the runtime. The installer saves these values in the environment file.
+
 ## Compatibility checks
 
 Run the full check after each official Grok Bot package update:

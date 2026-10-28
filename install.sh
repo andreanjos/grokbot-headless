@@ -39,8 +39,12 @@ escaped_app_bin="${app_bin//\\/\\\\}"
 escaped_app_bin="${escaped_app_bin//\"/\\\"}"
 escaped_daemon_script="${daemon_script//\\/\\\\}"
 escaped_daemon_script="${escaped_daemon_script//\"/\\\"}"
-printf 'GROK_BOT_BINARY="%s"\nGROK_BOT_DAEMON_SCRIPT="%s"\n' \
-  "$escaped_app_bin" "$escaped_daemon_script" > "$environment_path"
+{
+  printf 'GROK_BOT_BINARY="%s"\nGROK_BOT_DAEMON_SCRIPT="%s"\n' \
+    "$escaped_app_bin" "$escaped_daemon_script"
+  if [[ -n "${GROK_BOT_NODE:-}" ]]; then printf 'GROK_BOT_NODE="%s"\n' "$GROK_BOT_NODE"; fi
+  if [[ -n "${GROK_BOT_PACKAGE_JSON:-}" ]]; then printf 'GROK_BOT_PACKAGE_JSON="%s"\n' "$GROK_BOT_PACKAGE_JSON"; fi
+} > "$environment_path"
 chmod 0600 "$environment_path"
 systemctl --user daemon-reload
 systemctl --user enable grok-bot-headless.service

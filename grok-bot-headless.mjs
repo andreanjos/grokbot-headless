@@ -29,6 +29,9 @@ const HEARTBEAT_PATH = join(DATA_ROOT, 'local-exec-supervisor.json');
 const DISCOVERY_PATH = join(DATA_ROOT, 'local-exec-daemon.json');
 const SETTINGS_PATH = join(DATA_ROOT, 'settings.json');
 const APP_BINARY = process.env.GROK_BOT_BINARY || '/opt/Grok Bot/grok-bot';
+// Optional: run the daemon with a plain Node.js binary (for example when the app's RunAsNode fuse is off).
+const NODE_BINARY = process.env.GROK_BOT_NODE || null;
+const RUNTIME_BINARY = NODE_BINARY || APP_BINARY;
 const DAEMON_SCRIPT = process.env.GROK_BOT_DAEMON_SCRIPT || '/opt/Grok Bot/resources/app.asar/dist/local-exec-daemon/main.cjs';
 const DAEMON_CONTAINER_PATH = DAEMON_SCRIPT.includes('.asar/')
   ? `${DAEMON_SCRIPT.slice(0, DAEMON_SCRIPT.indexOf('.asar/'))}.asar`
@@ -189,7 +192,7 @@ const heartbeat = () => atomicJson(HEARTBEAT_PATH, { pid: process.pid, at: Date.
 // --- Official application ----------------------------------------------------
 
 function appNode(code) {
-  return execFileSync(APP_BINARY, ['-e', code], {
+  return execFileSync(RUNTIME_BINARY, ['-e', code], {
     encoding: 'utf8',
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -227,7 +230,7 @@ async function assertAppInstalled() {
 
 function spawnDaemon(machineId) {
   const child = fork(DAEMON_SCRIPT, [], {
-    execPath: APP_BINARY,
+    execPath: RUNTIME_BINARY,
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
